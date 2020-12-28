@@ -1,0 +1,364 @@
+```
+constantPoolHandle ClassFileParser::parse_constant_pool(TRAPS) {
+  ClassFileStream* cfs = stream();
+  constantPoolHandle nullHandle;
+
+  cfs->guarantee_more(3, CHECK_(nullHandle)); // length, first cp tag
+  // 常量池大小
+  u2 length = cfs->get_u2_fast();
+  guarantee_property(
+    length >= 1, "Illegal constant pool size %u in class file %s",
+    length, CHECK_(nullHandle));
+  // 为常量池分配内存    
+  ConstantPool* constant_pool = ConstantPool::allocate(_loader_data, length,
+                                                        CHECK_(nullHandle));
+  _cp = constant_pool; // save in case of errors
+  constantPoolHandle cp (THREAD, constant_pool);
+
+  // parsing constant pool entries
+  parse_constant_pool_entries(length, CHECK_(nullHandle));
+
+  int index = 1;  // declared outside of loops for portability
+
+  // 第一次验证通过-验证交叉引用和修复类和字符串常量
+  for (index = 1; index < length; index++) {          // Index 0 is unused
+    jbyte tag = cp->tag_at(index).value();
+    switch (tag) {
+      case JVM_CONSTANT_Class :
+        ShouldNotReachHere();     // Only JVM_CONSTANT_ClassIndex should be present
+        break;
+      case JVM_CONSTANT_Fieldref :
+        // fall through
+      case JVM_CONSTANT_Methodref :
+        // fall through
+      case JVM_CONSTANT_InterfaceMethodref : {
+        if (!_need_verify) break;
+        int klass_ref_index = cp->klass_ref_index_at(index);
+        int name_and_type_ref_index = cp->name_and_type_ref_index_at(index);
+        // 验证符号引用是否正确
+        check_property(valid_klass_reference_at(klass_ref_index),
+                       "Invalid constant pool index %u in class file %s",
+                       klass_ref_index,
+                       CHECK_(nullHandle));
+        check_property(valid_cp_range(name_and_type_ref_index, length) &&
+                       cp->tag_at(name_and_type_ref_index).is_name_and_type(),
+                       "Invalid constant pool index %u in class file %s",
+                       name_and_type_ref_index,
+                       CHECK_(nullHandle));
+        break;
+      }
+      case JVM_CONSTANT_String :
+        ShouldNotReachHere();     // Only JVM_CONSTANT_StringIndex should be present
+        break;
+      case JVM_CONSTANT_Integer :
+        break;
+      case JVM_CONSTANT_Float :
+        break;
+      case JVM_CONSTANT_Long :
+      case JVM_CONSTANT_Double :
+        index++;
+        check_property(
+          (index < length && cp->tag_at(index).is_invalid()),
+          "Improper constant pool long/double index %u in class file %s",
+          index, CHECK_(nullHandle));
+        break;
+      case JVM_CONSTANT_NameAndType : {
+        if (!_need_verify) break;
+        int name_ref_index = cp->name_ref_index_at(index);
+        int signature_ref_index = cp->signature_ref_index_at(index);
+        check_property(valid_symbol_at(name_ref_index),
+                 "Invalid constant pool index %u in class file %s",
+                 name_ref_index, CHECK_(nullHandle));
+        check_property(valid_symbol_at(signature_ref_index),
+                 "Invalid constant pool index %u in class file %s",
+                 signature_ref_index, CHECK_(nullHandle));
+        break;
+      }
+      case JVM_CONSTANT_Utf8 :
+        break;
+      case JVM_CONSTANT_UnresolvedClass :         // fall-through
+      case JVM_CONSTANT_UnresolvedClassInError:
+        ShouldNotReachHere();     // Only JVM_CONSTANT_ClassIndex should be present
+        break;
+      case JVM_CONSTANT_ClassIndex :
+        {
+          int class_index = cp->klass_index_at(index);
+          check_property(valid_symbol_at(class_index),
+                 "Invalid constant pool index %u in class file %s",
+                 class_index, CHECK_(nullHandle));
+          cp->unresolved_klass_at_put(index, cp->symbol_at(class_index));
+        }
+        break;
+      case JVM_CONSTANT_StringIndex :
+        {
+          int string_index = cp->string_index_at(index);
+          check_property(valid_symbol_at(string_index),
+                 "Invalid constant pool index %u in class file %s",
+                 string_index, CHECK_(nullHandle));
+          Symbol* sym = cp->symbol_at(string_index);
+          cp->unresolved_string_at_put(index, sym);
+        }
+        break;
+      case JVM_CONSTANT_MethodHandle :
+        {
+          int ref_index = cp->method_handle_index_at(index);
+          check_property(
+            valid_cp_range(ref_index, length) &&
+                EnableInvokeDynamic,
+              "Invalid constant pool index %u in class file %s",
+              ref_index, CHECK_(nullHandle));
+          constantTag tag = cp->tag_at(ref_index);
+          int ref_kind  = cp->method_handle_ref_kind_at(index);
+          switch (ref_kind) {
+          case JVM_REF_getField:
+          case JVM_REF_getStatic:
+          case JVM_REF_putField:
+          case JVM_REF_putStatic:
+            check_property(
+              tag.is_field(),
+              "Invalid constant pool index %u in class file %s (not a field)",
+              ref_index, CHECK_(nullHandle));
+            break;
+          case JVM_REF_invokeVirtual:
+          case JVM_REF_newInvokeSpecial:
+            check_property(
+              tag.is_method(),
+              "Invalid constant pool index %u in class file %s (not a method)",
+              ref_index, CHECK_(nullHandle));
+            break;
+          case JVM_REF_invokeStatic:
+          case JVM_REF_invokeSpecial:
+            check_property(tag.is_method() ||
+                           ((_major_version >= JAVA_8_VERSION) && tag.is_interface_method()),
+               "Invalid constant pool index %u in class file %s (not a method)",
+               ref_index, CHECK_(nullHandle));
+             break;
+          case JVM_REF_invokeInterface:
+            check_property(
+              tag.is_interface_method(),
+              "Invalid constant pool index %u in class file %s (not an interface method)",
+              ref_index, CHECK_(nullHandle));
+            break;
+          default:
+            classfile_parse_error(
+              "Bad method handle kind at constant pool index %u in class file %s",
+              index, CHECK_(nullHandle));
+          }
+          // Keep the ref_index unchanged.  It will be indirected at link-time.
+        }
+        break;
+      case JVM_CONSTANT_MethodType :
+        {
+          int ref_index = cp->method_type_index_at(index);
+          check_property(valid_symbol_at(ref_index) && EnableInvokeDynamic,
+                 "Invalid constant pool index %u in class file %s",
+                 ref_index, CHECK_(nullHandle));
+        }
+        break;
+      case JVM_CONSTANT_InvokeDynamic :
+        {
+          int name_and_type_ref_index = cp->invoke_dynamic_name_and_type_ref_index_at(index);
+          check_property(valid_cp_range(name_and_type_ref_index, length) &&
+                         cp->tag_at(name_and_type_ref_index).is_name_and_type(),
+                         "Invalid constant pool index %u in class file %s",
+                         name_and_type_ref_index,
+                         CHECK_(nullHandle));
+          // bootstrap specifier index must be checked later, when BootstrapMethods attr is available
+          break;
+        }
+      default:
+        fatal(err_msg("bad constant pool tag value %u",
+                      cp->tag_at(index).value()));
+        ShouldNotReachHere();
+        break;
+    } // end of switch
+  } // end of for
+
+  if (_cp_patches != NULL) {
+    // need to treat this_class specially...
+    assert(EnableInvokeDynamic, "");
+    int this_class_index;
+    {
+      cfs->guarantee_more(8, CHECK_(nullHandle));  // flags, this_class, super_class, infs_len
+      u1* mark = cfs->current();
+      u2 flags         = cfs->get_u2_fast();
+      this_class_index = cfs->get_u2_fast();
+      cfs->set_current(mark);  // revert to mark
+    }
+
+    for (index = 1; index < length; index++) {          // Index 0 is unused
+      if (has_cp_patch_at(index)) {
+        guarantee_property(index != this_class_index,
+                           "Illegal constant pool patch to self at %d in class file %s",
+                           index, CHECK_(nullHandle));
+        patch_constant_pool(cp, index, cp_patch_at(index), CHECK_(nullHandle));
+      }
+    }
+  }
+
+  if (!_need_verify) {
+    return cp;
+  }
+
+  // 第二个验证通过—检查字符串的格式是否正确。但对其它项还没有
+  for (index = 1; index < length; index++) {
+    jbyte tag = cp->tag_at(index).value();
+    switch (tag) {
+      case JVM_CONSTANT_UnresolvedClass: {
+        Symbol*  class_name = cp->unresolved_klass_at(index);
+        // check the name, even if _cp_patches will overwrite it
+        verify_legal_class_name(class_name, CHECK_(nullHandle));
+        break;
+      }
+      case JVM_CONSTANT_NameAndType: {
+        if (_need_verify && _major_version >= JAVA_7_VERSION) {
+          int sig_index = cp->signature_ref_index_at(index);
+          int name_index = cp->name_ref_index_at(index);
+          Symbol*  name = cp->symbol_at(name_index);
+          Symbol*  sig = cp->symbol_at(sig_index);
+          if (sig->byte_at(0) == JVM_SIGNATURE_FUNC) {
+            verify_legal_method_signature(name, sig, CHECK_(nullHandle));
+          } else {
+            verify_legal_field_signature(name, sig, CHECK_(nullHandle));
+          }
+        }
+        break;
+      }
+      case JVM_CONSTANT_InvokeDynamic:
+      case JVM_CONSTANT_Fieldref:
+      case JVM_CONSTANT_Methodref:
+      case JVM_CONSTANT_InterfaceMethodref: {
+        int name_and_type_ref_index = cp->name_and_type_ref_index_at(index);
+        // already verified to be utf8
+        int name_ref_index = cp->name_ref_index_at(name_and_type_ref_index);
+        // already verified to be utf8
+        int signature_ref_index = cp->signature_ref_index_at(name_and_type_ref_index);
+        Symbol*  name = cp->symbol_at(name_ref_index);
+        Symbol*  signature = cp->symbol_at(signature_ref_index);
+        if (tag == JVM_CONSTANT_Fieldref) {
+          verify_legal_field_name(name, CHECK_(nullHandle));
+          if (_need_verify && _major_version >= JAVA_7_VERSION) {
+            // Signature is verified above, when iterating NameAndType_info.
+            // Need only to be sure it's the right type.
+            if (signature->byte_at(0) == JVM_SIGNATURE_FUNC) {
+              throwIllegalSignature(
+                  "Field", name, signature, CHECK_(nullHandle));
+            }
+          } else {
+            verify_legal_field_signature(name, signature, CHECK_(nullHandle));
+          }
+        } else {
+          verify_legal_method_name(name, CHECK_(nullHandle));
+          if (_need_verify && _major_version >= JAVA_7_VERSION) {
+            // Signature is verified above, when iterating NameAndType_info.
+            // Need only to be sure it's the right type.
+            if (signature->byte_at(0) != JVM_SIGNATURE_FUNC) {
+              throwIllegalSignature(
+                  "Method", name, signature, CHECK_(nullHandle));
+            }
+          } else {
+            verify_legal_method_signature(name, signature, CHECK_(nullHandle));
+          }
+          if (tag == JVM_CONSTANT_Methodref) {
+            // 4509014: If a class method name begins with '<', it must be "<init>".
+            assert(name != NULL, "method name in constant pool is null");
+            unsigned int name_len = name->utf8_length();
+            assert(name_len > 0, "bad method name");  // already verified as legal name
+            if (name->byte_at(0) == '<') {
+              if (name != vmSymbols::object_initializer_name()) {
+                classfile_parse_error(
+                  "Bad method name at constant pool index %u in class file %s",
+                  name_ref_index, CHECK_(nullHandle));
+              }
+            }
+          }
+        }
+        break;
+      }
+      case JVM_CONSTANT_MethodHandle: {
+        int ref_index = cp->method_handle_index_at(index);
+        int ref_kind  = cp->method_handle_ref_kind_at(index);
+        switch (ref_kind) {
+        case JVM_REF_invokeVirtual:
+        case JVM_REF_invokeStatic:
+        case JVM_REF_invokeSpecial:
+        case JVM_REF_newInvokeSpecial:
+          {
+            int name_and_type_ref_index = cp->name_and_type_ref_index_at(ref_index);
+            int name_ref_index = cp->name_ref_index_at(name_and_type_ref_index);
+            Symbol*  name = cp->symbol_at(name_ref_index);
+            if (ref_kind == JVM_REF_newInvokeSpecial) {
+              if (name != vmSymbols::object_initializer_name()) {
+                classfile_parse_error(
+                  "Bad constructor name at constant pool index %u in class file %s",
+                  name_ref_index, CHECK_(nullHandle));
+              }
+            } else {
+              if (name == vmSymbols::object_initializer_name()) {
+                classfile_parse_error(
+                  "Bad method name at constant pool index %u in class file %s",
+                  name_ref_index, CHECK_(nullHandle));
+              }
+            }
+          }
+          break;
+          // Other ref_kinds are already fully checked in previous pass.
+        }
+        break;
+      }
+      case JVM_CONSTANT_MethodType: {
+        Symbol* no_name = vmSymbols::type_name(); // place holder
+        Symbol*  signature = cp->method_type_signature_at(index);
+        verify_legal_method_signature(no_name, signature, CHECK_(nullHandle));
+        break;
+      }
+      case JVM_CONSTANT_Utf8: {
+        assert(cp->symbol_at(index)->refcount() != 0, "count corrupted");
+      }
+    }  // end of switch
+  }  // end of for
+
+  return cp;
+}
+```
+
+#### 常量池内存分配
+```
+// 常量池大小
+  u2 length = cfs->get_u2_fast();
+  guarantee_property(
+    length >= 1, "Illegal constant pool size %u in class file %s",
+    length, CHECK_(nullHandle));
+  // 为常量池分配内存    
+  ConstantPool* constant_pool = ConstantPool::allocate(_loader_data, length,CHECK_(nullHandle));
+```
+ConstantPool.cpp
+```
+ConstantPool* ConstantPool::allocate(ClassLoaderData* loader_data, int length, TRAPS) {
+  // Tags are RW but comment below applies to tags also.
+  Array<u1>* tags = MetadataFactory::new_writeable_array<u1>(loader_data, length, 0, CHECK_NULL);
+
+  int size = ConstantPool::size(length);
+
+  /*    CDS的考虑:
+   * 分配读-写，但是如果所有的klass都被解析，那么在转储时可能会变为只读。
+   * 惟一可写的其他字段是resolved_references数组，它在启动时重新创建。
+   * 但这可以转移到InstanceKlass(尽管从汇编代码访问很麻烦)。
+   * 也许可以移动到cpCache，也就是RW。
+   */
+  return new (loader_data, size, false, MetaspaceObj::ConstantPoolType, THREAD) ConstantPool(tags);
+}
+
+static int size(int length)          { return align_object_size(header_size() + length); }
+
+static int header_size()             { return sizeof(ConstantPool)/HeapWordSize; }
+```
+globalDefintions.hpp
+```
+#define align_object_size_(size) align_size_up_(size, MinObjAlignment)
+
+#define align_size_up_(size, alignment) (((size) + ((alignment) - 1)) & ~((alignment) - 1))
+
+// HeapWordSize must be 2^LogHeapWordSize. 
+const int HeapWordSize        = sizeof(HeapWord);
+```
