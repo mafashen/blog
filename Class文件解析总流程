@@ -1,0 +1,491 @@
+```
+instanceKlassHandle ClassFileParser::parseClassFile(Symbol* name,
+                                                    ClassLoaderData* loader_data,
+                                                    Handle protection_domain,
+                                                    KlassHandle host_klass,
+                                                    GrowableArray<Handle>* cp_patches,
+                                                    TempNewSymbol& parsed_name,
+                                                    bool verify,
+                                                    TRAPS) {
+  JvmtiCachedClassFileData *cached_class_file = NULL;
+  Handle class_loader(THREAD, loader_data->class_loader());
+  bool has_default_methods = false;
+  ResourceMark rm(THREAD);
+
+  ClassFileStream* cfs = stream();
+  assert(THREAD->is_Java_thread(), "must be a JavaThread");
+  JavaThread* jt = (JavaThread*) THREAD;
+
+  PerfClassTraceTime ctimer(ClassLoader::perf_class_parse_time(),
+                            ClassLoader::perf_class_parse_selftime(),
+                            NULL,
+                            jt->get_thread_stat()->perf_recursion_counts_addr(),
+                            jt->get_thread_stat()->perf_timers_addr(),
+                            PerfClassTraceTime::PARSE_CLASS);
+
+  init_parsed_class_attributes(loader_data);
+
+  if (JvmtiExport::should_post_class_file_load_hook()) {
+    // Get the cached class file bytes (if any) from the class that
+    // is being redefined or retransformed. We use jvmti_thread_state()
+    // instead of JvmtiThreadState::state_for(jt) so we don't allocate
+    // a JvmtiThreadState any earlier than necessary. This will help
+    // avoid the bug described by 7126851.
+    JvmtiThreadState *state = jt->jvmti_thread_state();
+    if (state != NULL) {
+      KlassHandle *h_class_being_redefined =
+                     state->get_class_being_redefined();
+      if (h_class_being_redefined != NULL) {
+        instanceKlassHandle ikh_class_being_redefined =
+          instanceKlassHandle(THREAD, (*h_class_being_redefined)());
+        cached_class_file = ikh_class_being_redefined->get_cached_class_file();
+      }
+    }
+
+    unsigned char* ptr = cfs->buffer();
+    unsigned char* end_ptr = cfs->buffer() + cfs->length();
+
+    JvmtiExport::post_class_file_load_hook(name, class_loader(), protection_domain,
+                                           &ptr, &end_ptr, &cached_class_file);
+
+    if (ptr != cfs->buffer()) {
+      // JVMTI agent has modified class file data.
+      // Set new class file stream using JVMTI agent modified
+      // class file data.
+      cfs = new ClassFileStream(ptr, end_ptr - ptr, cfs->source());
+      set_stream(cfs);
+    }
+  }
+
+  _host_klass = host_klass;
+  _cp_patches = cp_patches;
+
+  instanceKlassHandle nullHandle;
+
+  // Figure out whether we can skip format checking (matching classic VM behavior)
+  _need_verify = Verifier::should_verify_for(class_loader(), verify);
+
+  // Set the verify flag in stream
+  cfs->set_verify(_need_verify);
+
+  // Save the class file name for easier error message printing.
+  _class_name = (name != NULL) ? name : vmSymbols::unknown_class_name();
+
+  cfs->guarantee_more(8, CHECK_(nullHandle));  // magic, major, minor
+  // Magic value    解析魔数，class文件中魔数占用 u4 大小
+  u4 magic = cfs->get_u4_fast();
+  guarantee_property(magic == JAVA_CLASSFILE_MAGIC,
+                     "Incompatible magic value %u in class file %s",
+                     magic, CHECK_(nullHandle));
+
+  // Version numbers    解析版本号
+  u2 minor_version = cfs->get_u2_fast();
+  u2 major_version = cfs->get_u2_fast();
+
+  // Check version numbers - we check this even with verifier off
+  if (!is_supported_version(major_version, minor_version)) {
+    if (name == NULL) {
+      Exceptions::fthrow(
+        THREAD_AND_LOCATION,
+        vmSymbols::java_lang_UnsupportedClassVersionError(),
+        "Unsupported major.minor version %u.%u",
+        major_version,
+        minor_version);
+    } else {
+      ResourceMark rm(THREAD);
+      Exceptions::fthrow(
+        THREAD_AND_LOCATION,
+        vmSymbols::java_lang_UnsupportedClassVersionError(),
+        "%s : Unsupported major.minor version %u.%u",
+        name->as_C_string(),
+        major_version,
+        minor_version);
+    }
+    return nullHandle;
+  }
+
+  _major_version = major_version;
+  _minor_version = minor_version;
+
+
+  // Check if verification needs to be relaxed for this class file
+  // Do not restrict it to jdk1.0 or jdk1.1 to maintain backward compatibility (4982376)
+  _relax_verify = Verifier::relax_verify_for(class_loader());
+
+  // Constant pool  解析常量池
+  constantPoolHandle cp = parse_constant_pool(CHECK_(nullHandle));
+
+  int cp_size = cp->length();
+
+  cfs->guarantee_more(8, CHECK_(nullHandle));  // flags, this_class, super_class, infs_len
+
+  // Access flags   访问标志
+  AccessFlags access_flags;
+  jint flags = cfs->get_u2_fast() & JVM_RECOGNIZED_CLASS_MODIFIERS;
+
+  if ((flags & JVM_ACC_INTERFACE) && _major_version < JAVA_6_VERSION) {
+    // Set abstract bit for old class files for backward compatibility
+    flags |= JVM_ACC_ABSTRACT;
+  }
+  verify_legal_class_modifiers(flags, CHECK_(nullHandle));
+  access_flags.set_flags(flags);
+
+  // This class and superclass  解析class类名和父类名
+  u2 this_class_index = cfs->get_u2_fast();
+  check_property(
+    valid_cp_range(this_class_index, cp_size) &&
+      cp->tag_at(this_class_index).is_unresolved_klass(),
+    "Invalid this class index %u in constant pool in class file %s",
+    this_class_index, CHECK_(nullHandle));
+
+  Symbol*  class_name  = cp->unresolved_klass_at(this_class_index);
+  assert(class_name != NULL, "class_name can't be null");
+
+  // It's important to set parsed_name *before* resolving the super class.
+  // (it's used for cleanup by the caller if parsing fails)
+  parsed_name = class_name;
+  // parsed_name is returned and can be used if there's an error, so add to
+  // its reference count.  Caller will decrement the refcount.
+  parsed_name->increment_refcount();
+
+  // Update _class_name which could be null previously to be class_name
+  _class_name = class_name;
+
+  // Don't need to check whether this class name is legal or not.
+  // It has been checked when constant pool is parsed.
+  // However, make sure it is not an array type.
+  if (_need_verify) {
+    guarantee_property(class_name->byte_at(0) != JVM_SIGNATURE_ARRAY,
+                       "Bad class name in class file %s",
+                       CHECK_(nullHandle));
+  }
+
+  Klass* preserve_this_klass;   // for storing result across HandleMark
+
+  // release all handles when parsing is done
+  { HandleMark hm(THREAD);
+
+    // Checks if name in class file matches requested name
+    if (name != NULL && class_name != name) {
+      ResourceMark rm(THREAD);
+      Exceptions::fthrow(
+        THREAD_AND_LOCATION,
+        vmSymbols::java_lang_NoClassDefFoundError(),
+        "%s (wrong name: %s)",
+        name->as_C_string(),
+        class_name->as_C_string()
+      );
+      return nullHandle;
+    }
+
+    if (TraceClassLoadingPreorder) {
+      tty->print("[Loading %s", (name != NULL) ? name->as_klass_external_name() : "NoName");
+      if (cfs->source() != NULL) tty->print(" from %s", cfs->source());
+      tty->print_cr("]");
+    }
+    // 父类
+    u2 super_class_index = cfs->get_u2_fast();
+    instanceKlassHandle super_klass = parse_super_class(super_class_index,
+                                                        CHECK_NULL);
+
+    // Interfaces   实现的接口
+    u2 itfs_len = cfs->get_u2_fast();   // 接口总数
+    Array<Klass*>* local_interfaces =
+      parse_interfaces(itfs_len, protection_domain, _class_name,
+                       &has_default_methods, CHECK_(nullHandle));
+
+    // 解析字段
+    u2 java_fields_count = 0;
+    // Fields (offsets are filled in later)
+    FieldAllocationCount fac;
+    Array<u2>* fields = parse_fields(class_name,
+                                     access_flags.is_interface(),
+                                     &fac, &java_fields_count,
+                                     CHECK_(nullHandle));
+    // Methods  解析方法
+    bool has_final_method = false;
+    AccessFlags promoted_flags;
+    promoted_flags.set_flags(0);
+    Array<Method*>* methods = parse_methods(access_flags.is_interface(),
+                                            &promoted_flags,
+                                            &has_final_method,
+                                            &has_default_methods,
+                                            CHECK_(nullHandle));
+
+    // Additional attributes    解析属性
+    ClassAnnotationCollector parsed_annotations;
+    parse_classfile_attributes(&parsed_annotations, CHECK_(nullHandle));
+
+    // Make sure this is the end of class file stream   
+    guarantee_property(cfs->at_eos(), "Extra bytes at the end of class file %s", CHECK_(nullHandle));
+
+    // We check super class after class file is parsed and format is checked 检查父类
+    if (super_class_index > 0 && super_klass.is_null()) {
+      Symbol*  sk  = cp->klass_name_at(super_class_index);
+      if (access_flags.is_interface()) {
+        // Before attempting to resolve the superclass, check for class format
+        // errors not checked yet.
+        guarantee_property(sk == vmSymbols::java_lang_Object(),
+                           "Interfaces must have java.lang.Object as superclass in class file %s",
+                           CHECK_(nullHandle));
+      }
+      Klass* k = SystemDictionary::resolve_super_or_fail(class_name, sk,
+                                                         class_loader,
+                                                         protection_domain,
+                                                         true,
+                                                         CHECK_(nullHandle));
+
+      KlassHandle kh (THREAD, k);
+      super_klass = instanceKlassHandle(THREAD, kh());
+    }
+    if (super_klass.not_null()) {
+
+      if (super_klass->has_default_methods()) {
+        has_default_methods = true;
+      }
+
+      if (super_klass->is_interface()) {
+        ResourceMark rm(THREAD);
+        Exceptions::fthrow(
+          THREAD_AND_LOCATION,
+          vmSymbols::java_lang_IncompatibleClassChangeError(),
+          "class %s has interface %s as super class",
+          class_name->as_klass_external_name(),
+          super_klass->external_name()
+        );
+        return nullHandle;
+      }
+      // Make sure super class is not final
+      if (super_klass->is_final()) {
+        THROW_MSG_(vmSymbols::java_lang_VerifyError(), "Cannot inherit from final class", nullHandle);
+      }
+    }
+
+    // save super klass for error handling.
+    _super_klass = super_klass;
+
+    // Compute the transitive list of all unique interfaces implemented by this class
+    _transitive_interfaces =
+          compute_transitive_interfaces(super_klass, local_interfaces, CHECK_(nullHandle));
+
+    // sort methods
+    intArray* method_ordering = sort_methods(methods);
+
+    // promote flags from parse_methods() to the klass' flags
+    access_flags.add_promoted_flags(promoted_flags.as_int());
+
+    // Size of Java vtable (in words)
+    int vtable_size = 0;
+    int itable_size = 0;
+    int num_miranda_methods = 0;
+
+    GrowableArray<Method*> all_mirandas(20);
+
+    klassVtable::compute_vtable_size_and_num_mirandas(
+        &vtable_size, &num_miranda_methods, &all_mirandas, super_klass(), methods,
+        access_flags, class_loader, class_name, local_interfaces,
+                                                      CHECK_(nullHandle));
+
+    // Size of Java itable (in words)
+    itable_size = access_flags.is_interface() ? 0 : klassItable::compute_itable_size(_transitive_interfaces);
+
+    FieldLayoutInfo info;
+    layout_fields(class_loader, &fac, &parsed_annotations, &info, CHECK_NULL);
+
+    int total_oop_map_size2 =
+          InstanceKlass::nonstatic_oop_map_size(info.total_oop_map_count);
+
+    // Compute reference type
+    ReferenceType rt;
+    if (super_klass() == NULL) {
+      rt = REF_NONE;
+    } else {
+      rt = super_klass->reference_type();
+    }
+
+    // We can now create the basic Klass* for this klass
+    _klass = InstanceKlass::allocate_instance_klass(loader_data,
+                                                    vtable_size,
+                                                    itable_size,
+                                                    info.static_field_size,
+                                                    total_oop_map_size2,
+                                                    rt,
+                                                    access_flags,
+                                                    name,
+                                                    super_klass(),
+                                                    !host_klass.is_null(),
+                                                    CHECK_(nullHandle));
+    instanceKlassHandle this_klass (THREAD, _klass);
+
+    assert(this_klass->static_field_size() == info.static_field_size, "sanity");
+    assert(this_klass->nonstatic_oop_map_count() == info.total_oop_map_count,
+           "sanity");
+
+    // Fill in information already parsed 将已经解析过的信息填充到instanceKlass上
+    this_klass->set_should_verify_class(verify);
+    jint lh = Klass::instance_layout_helper(info.instance_size, false);
+    this_klass->set_layout_helper(lh);
+    assert(this_klass->oop_is_instance(), "layout is correct");
+    assert(this_klass->size_helper() == info.instance_size, "correct size_helper");
+    // Not yet: supers are done below to support the new subtype-checking fields
+    //this_klass->set_super(super_klass());
+    this_klass->set_class_loader_data(loader_data);
+    this_klass->set_nonstatic_field_size(info.nonstatic_field_size);
+    this_klass->set_has_nonstatic_fields(info.has_nonstatic_fields);
+    this_klass->set_static_oop_field_count(fac.count[STATIC_OOP]);
+
+    apply_parsed_class_metadata(this_klass, java_fields_count, CHECK_NULL);
+
+    if (has_final_method) {
+      this_klass->set_has_final_method();
+    }
+    this_klass->copy_method_ordering(method_ordering, CHECK_NULL);
+    // The InstanceKlass::_methods_jmethod_ids cache
+    // is managed on the assumption that the initial cache
+    // size is equal to the number of methods in the class. If
+    // that changes, then InstanceKlass::idnum_can_increment()
+    // has to be changed accordingly.
+    this_klass->set_initial_method_idnum(methods->length());
+    this_klass->set_name(cp->klass_name_at(this_class_index));
+    if (is_anonymous())  // I am well known to myself
+      cp->klass_at_put(this_class_index, this_klass()); // eagerly resolve
+
+    this_klass->set_minor_version(minor_version);
+    this_klass->set_major_version(major_version);
+    this_klass->set_has_default_methods(has_default_methods);
+
+    // Set up Method*::intrinsic_id as soon as we know the names of methods.
+    // (We used to do this lazily, but now we query it in Rewriter,
+    // which is eagerly done for every method, so we might as well do it now,
+    // when everything is fresh in memory.)
+    if (Method::klass_id_for_intrinsics(this_klass()) != vmSymbols::NO_SID) {
+      for (int j = 0; j < methods->length(); j++) {
+        methods->at(j)->init_intrinsic_id();
+      }
+    }
+
+    if (cached_class_file != NULL) {
+      // JVMTI: we have an InstanceKlass now, tell it about the cached bytes
+      this_klass->set_cached_class_file(cached_class_file);
+    }
+
+    // Fill in field values obtained by parse_classfile_attributes
+    if (parsed_annotations.has_any_annotations())
+      parsed_annotations.apply_to(this_klass);
+    apply_parsed_class_attributes(this_klass);
+
+    // Miranda methods
+    if ((num_miranda_methods > 0) ||
+        // if this class introduced new miranda methods or
+        (super_klass.not_null() && (super_klass->has_miranda_methods()))
+        // super class exists and this class inherited miranda methods
+        ) {
+      this_klass->set_has_miranda_methods(); // then set a flag
+    }
+
+    // Fill in information needed to compute superclasses.
+    this_klass->initialize_supers(super_klass(), CHECK_(nullHandle));
+
+    // Initialize itable offset tables
+    klassItable::setup_itable_offset_table(this_klass);
+
+    // Compute transitive closure of interfaces this class implements
+    // Do final class setup
+    fill_oop_maps(this_klass, info.nonstatic_oop_map_count, info.nonstatic_oop_offsets, info.nonstatic_oop_counts);
+
+    // Fill in has_finalizer, has_vanilla_constructor, and layout_helper
+    set_precomputed_flags(this_klass);
+
+    // reinitialize modifiers, using the InnerClasses attribute
+    int computed_modifiers = this_klass->compute_modifier_flags(CHECK_(nullHandle));
+    this_klass->set_modifier_flags(computed_modifiers);
+
+    // check if this class can access its super class
+    check_super_class_access(this_klass, CHECK_(nullHandle));
+
+    // check if this class can access its superinterfaces
+    check_super_interface_access(this_klass, CHECK_(nullHandle));
+
+    // check if this class overrides any final method
+    check_final_method_override(this_klass, CHECK_(nullHandle));
+
+    // check that if this class is an interface then it doesn't have static methods
+    if (this_klass->is_interface()) {
+      /* An interface in a JAVA 8 classfile can be static */
+      if (_major_version < JAVA_8_VERSION) {
+        check_illegal_static_method(this_klass, CHECK_(nullHandle));
+      }
+    }
+
+    // Allocate mirror and initialize static fields
+    java_lang_Class::create_mirror(this_klass, protection_domain, CHECK_(nullHandle));
+
+
+    // Generate any default methods - default methods are interface methods
+    // that have a default implementation.  This is new with Lambda project.
+    if (has_default_methods ) {
+      DefaultMethods::generate_default_methods(
+          this_klass(), &all_mirandas, CHECK_(nullHandle));
+    }
+
+    // Update the loader_data graph.
+    record_defined_class_dependencies(this_klass, CHECK_NULL);
+
+    ClassLoadingService::notify_class_loaded(InstanceKlass::cast(this_klass()),
+                                             false /* not shared class */);
+
+    if (TraceClassLoading) {
+      ResourceMark rm;
+      // print in a single call to reduce interleaving of output
+      if (cfs->source() != NULL) {
+        tty->print("[Loaded %s from %s]\n", this_klass->external_name(),
+                   cfs->source());
+      } else if (class_loader.is_null()) {
+        if (THREAD->is_Java_thread()) {
+          Klass* caller = ((JavaThread*)THREAD)->security_get_caller_class(1);
+          tty->print("[Loaded %s by instance of %s]\n",
+                     this_klass->external_name(),
+                     InstanceKlass::cast(caller)->external_name());
+        } else {
+          tty->print("[Loaded %s]\n", this_klass->external_name());
+        }
+      } else {
+        tty->print("[Loaded %s from %s]\n", this_klass->external_name(),
+                   InstanceKlass::cast(class_loader->klass())->external_name());
+      }
+    }
+
+    if (TraceClassResolution) {
+      ResourceMark rm;
+      // print out the superclass.
+      const char * from = this_klass()->external_name();
+      if (this_klass->java_super() != NULL) {
+        tty->print("RESOLVE %s %s (super)\n", from, InstanceKlass::cast(this_klass->java_super())->external_name());
+      }
+      // print out each of the interface classes referred to by this class.
+      Array<Klass*>* local_interfaces = this_klass->local_interfaces();
+      if (local_interfaces != NULL) {
+        int length = local_interfaces->length();
+        for (int i = 0; i < length; i++) {
+          Klass* k = local_interfaces->at(i);
+          InstanceKlass* to_class = InstanceKlass::cast(k);
+          const char * to = to_class->external_name();
+          tty->print("RESOLVE %s %s (interface)\n", from, to);
+        }
+      }
+    }
+
+    // preserve result across HandleMark
+    preserve_this_klass = this_klass();
+  }
+
+  // Create new handle outside HandleMark (might be needed for
+  // Extended Class Redefinition)
+  instanceKlassHandle this_klass (THREAD, preserve_this_klass);
+  debug_only(this_klass->verify();)
+
+  // Clear class if no error has occurred so destructor doesn't deallocate it
+  _klass = NULL;
+  return this_klass;
+}
+```
