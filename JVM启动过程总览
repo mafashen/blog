@@ -1,0 +1,20 @@
+
+```
+graph TD
+A[main main#c]-->B[JLI_Launch java#c]
+B-->C[LoadJavaVM java_md_solinux#c获取JNI_CreateJavaVM地址]
+C-->D[JVMInit java_md_solinux#c]
+D-->E[ContinueInNewThread java#c]
+E-->F[ContinueInNewThread0 java_md_solinux#c]
+F-->G[JavaMain java#c]
+G-->H[InitializeJVM]
+H-->I[JNI_CreateJavaVM jni#cpp]
+I-->J[create_vm thread#cpp]
+J-->K[LoadMainClass java#c]
+K-->L[CallStaticVoidMethod jni#cpp]
+L-->M[jni_CallStaticVoidMethod]
+M-->N[JavaCalls::call javaCall#cpp]
+N-->O[JavaCalls::call_helper]
+O-->p[StubRoutines::call_stub]
+p-->q[entry_point method::_from_interpreted_entry Java main方法字节码指令入口]
+```
