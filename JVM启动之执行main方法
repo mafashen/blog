@@ -1,0 +1,199 @@
+JVM创建完成后，会加载启动类，执行其main方法
+
+#### 加载mainClass
+```
+//java.c
+static jclass LoadMainClass(JNIEnv *env, int mode, char *name)
+{
+    jmethodID mid;
+    jstring str;
+    jobject result;
+    jlong start, end;
+    // 获取 sun/launcher/LauncherHelper 启动辅助类
+    jclass cls = GetLauncherHelperClass(env);
+    NULL_CHECK0(cls);
+    if (JLI_IsTraceLauncher()) {
+        start = CounterGet();
+    }
+    // 获取 checkAndLoadMain 方法句柄
+    NULL_CHECK0(mid = (*env)->GetStaticMethodID(env, cls,
+                "checkAndLoadMain",
+                "(ZILjava/lang/String;)Ljava/lang/Class;"));
+
+    str = NewPlatformString(env, name);
+    // 调用 checkAndLoadMain 方法加载主类
+    result = (*env)->CallStaticObjectMethod(env, cls, mid, USE_STDERR, mode, str);  //mode:LM_CLASS
+
+    if (JLI_IsTraceLauncher()) {
+        end   = CounterGet();
+        printf("%ld micro seconds to load main class\n",
+               (long)(jint)Counter2Micros(end-start));
+        printf("----%s----\n", JLDEBUG_ENV_ENTRY);
+    }
+
+    return (jclass)result;
+}
+```
+通过BootstrapClassLoader加载LauncherHelper
+```
+jclass GetLauncherHelperClass(JNIEnv *env)
+{
+    if (helperClass == NULL) {
+        NULL_CHECK0(helperClass = FindBootStrapClass(env,
+                "sun/launcher/LauncherHelper"));
+    }
+    return helperClass;
+}
+```
+```
+//java_md.c
+static FindClassFromBootLoader_t *findBootClass = NULL;
+
+jclass FindBootStrapClass(JNIEnv *env, const char *classname)
+{
+   HMODULE hJvm;
+
+   if (findBootClass == NULL) {
+       hJvm = GetModuleHandle(JVM_DLL);
+       if (hJvm == NULL) return NULL;
+       /* need to use the demangled entry point */
+       findBootClass = (FindClassFromBootLoader_t *)GetProcAddress(hJvm,
+            "JVM_FindClassFromBootLoader");
+       if (findBootClass == NULL) {
+          JLI_ReportErrorMessage(DLL_ERROR4, "JVM_FindClassFromBootLoader");
+          return NULL;
+       }
+   }
+   //函数指针直接调用
+   return findBootClass(env, classname);
+}
+```
+定义的 函数指针
+```
+//java.h
+typedef jclass (JNICALL FindClassFromBootLoader_t(JNIEnv *env,const char *name));
+```
+
+```
+//jvm.cpp
+JVM_ENTRY(jclass, JVM_FindClassFromBootLoader(JNIEnv* env,
+                                              const char* name))
+  JVMWrapper2("JVM_FindClassFromBootLoader %s", name);
+
+  // Java libraries should ensure that name is never null...
+  if (name == NULL || (int)strlen(name) > Symbol::max_length()) {
+    // It's impossible to create this class;  the name cannot fit
+    // into the constant pool.
+    return NULL;
+  }
+
+  TempNewSymbol h_name = SymbolTable::new_symbol(name, CHECK_NULL);
+  // 通过 BootstrapClassLoader 加载类
+  Klass* k = SystemDictionary::resolve_or_null(h_name, CHECK_NULL);
+  if (k == NULL) {
+    return NULL;
+  }
+
+  if (TraceClassResolution) {
+    trace_class_resolution(k);
+  }
+  return (jclass) JNIHandles::make_local(env, k->java_mirror());
+JVM_END
+```
+
+---
+
+```
+    public static Class<?> checkAndLoadMain(boolean printToStderr,
+                                            int mode,
+                                            String what) {
+        initOutput(printToStderr);
+        // get the class name
+        String cn = null;
+        switch (mode) {
+            case LM_CLASS:
+                cn = what;
+                break;
+            case LM_JAR:
+                cn = getMainClassFromJar(what);
+                break;
+            default:
+                // should never happen
+                throw new InternalError("" + mode + ": Unknown launch mode");
+        }
+        cn = cn.replace('/', '.');
+        Class<?> mainClass = null;
+        try {
+            mainClass = scloader.loadClass(cn);
+        } catch (NoClassDefFoundError | ClassNotFoundException cnfe) {
+            if (System.getProperty("os.name", "").contains("OS X")
+                && Normalizer.isNormalized(cn, Normalizer.Form.NFD)) {
+                try {
+                    // On Mac OS X since all names with diacretic symbols are given as decomposed it
+                    // is possible that main class name comes incorrectly from the command line
+                    // and we have to re-compose it
+                    mainClass = scloader.loadClass(Normalizer.normalize(cn, Normalizer.Form.NFC));
+                } catch (NoClassDefFoundError | ClassNotFoundException cnfe1) {
+                    abort(cnfe, "java.launcher.cls.error1", cn);
+                }
+            } else {
+                abort(cnfe, "java.launcher.cls.error1", cn);
+            }
+        }
+        // set to mainClass
+        appClass = mainClass;
+
+        ...
+
+        //检查main方法
+        validateMainClass(mainClass);
+        return mainClass;
+    }
+```
+最终返回的是 **Launcher** 中定义的 **APPClassLoader** 
+```java
+private static final ClassLoader scloader = ClassLoader.getSystemClassLoader();
+```
+一路分析下来，**LauncherHelper** 的作用就是：通过加载 LauncherHelper，触发 **Launcher** 的类加载，从而触发 ClassLoader 层级结构的建立； 再通过 **AppClassLoader** 加载主类，并验证main方法。
+
+---
+
+#### 调用main方法
+```
+int JNICALL
+JavaMain(void * _args)
+{
+    ...
+    //初始化JVM
+    if (!InitializeJVM(&vm, &env, &ifn)) {
+        JLI_ReportErrorMessage(JVM_ERROR1);
+        exit(1);
+    }
+
+    ...
+    
+    mainClass = LoadMainClass(env, mode, what);
+    CHECK_EXCEPTION_NULL_LEAVE(mainClass);
+   
+    appClass = GetApplicationClass(env);
+    NULL_CHECK_RETURN_VALUE(appClass, -1);
+   
+    PostJVMInit(env, appClass, vm);
+    /*
+     * LoadMainClass中已经验证过main方法的正确性，所以这里不在需要验证 
+     * 这里调用main方法，以便不在应用程序堆栈跟踪中调用无关的java堆栈
+     */
+    mainID = (*env)->GetStaticMethodID(env, mainClass, "main",
+                                       "([Ljava/lang/String;)V");
+    CHECK_EXCEPTION_NULL_LEAVE(mainID);
+
+    /* Build platform specific argument array */
+    mainArgs = CreateApplicationArgs(env, argv, argc);
+    CHECK_EXCEPTION_NULL_LEAVE(mainArgs);
+
+    /* Invoke main method. */
+    (*env)->CallStaticVoidMethod(env, mainClass, mainID, mainArgs);
+    ret = (*env)->ExceptionOccurred(env) == NULL ? 0 : 1;
+    LEAVE();
+}
+```
