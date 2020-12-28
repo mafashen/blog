@@ -1,0 +1,613 @@
+#### new 字节码的定义与实现
+```
+def(_new                 , "new"                 , "bkk"  , NULL    , T_OBJECT ,  1, true );
+```
+
+interpreterRuntime.cpp 在进行新建对象前，会先确保类已经完成类加载过程，然后进行内存分配工作
+```
+IRT_ENTRY(void, InterpreterRuntime::_new(JavaThread* thread, ConstantPool* pool, int index))
+  Klass* k_oop = pool->klass_at(index, CHECK);
+  instanceKlassHandle klass (THREAD, k_oop);
+
+  // 确保不是抽象类
+  klass->check_valid_for_instantiation(true, CHECK);
+
+  // 确保类已经初始化化过（里面会进一步触发验证、链接）
+  klass->initialize(CHECK);
+
+  // 此时，由于递归初始化，类可能没有完全初始化. 
+  // 如果它是完全初始化和has_finalize没有设置，我们重写它到它的快速版本
+  // (注意:这里不需要锁定，因为这是一个原子字节写入，可以执行多次).
+  //
+  // Note: 对于带有has_finalize的类，我们不重写，
+  // 因为这样可以节省额外的检入快速版本的时间，而快速版本无论如何都会调用慢版本(并回调Java)。
+  // 如果有断点，则不重写，因为_breakpoint字节码将丢失。
+  oop obj = klass->allocate_instance(CHECK);
+  // 在线程栈中设置对象引用
+  thread->set_vm_result(obj);
+IRT_END
+```
+
+---
+
+#### 为对象分配内存
+如果class已经完成了解析的过程，则可以直接为对象分配内存，否则需要先进行解析的过程
+```
+instanceOop InstanceKlass::allocate_instance(TRAPS) {
+  bool has_finalizer_flag = has_finalizer(); // Query before possible GC
+  int size = size_helper();  // Query before forming handle.
+
+  KlassHandle h_k(THREAD, this);
+
+  instanceOop i;
+
+  i = (instanceOop)CollectedHeap::obj_allocate(h_k, size, CHECK_NULL);
+  if (has_finalizer_flag && !RegisterFinalizersAtInit) {
+    i = register_finalizer(i, CHECK_NULL);
+  }
+  return i;
+}
+```
+
+##### 对象大小
+```
+int size_helper() const {
+    return layout_helper_to_size_helper(layout_helper());
+  }
+```
+```
+static int layout_helper_to_size_helper(jint lh) {
+    assert(lh > (jint)_lh_neutral_value, "must be instance");
+    // Note that the following expression discards _lh_instance_slow_path_bit.
+    return lh >> LogHeapWordSize;
+  }
+```
+```
+jint        _layout_helper;
+```
+**_layout_helper** 是对象布局的组合描述符.对于既不是实例也不是数组的klass，值为零;对于实例，则是一个正数，即实例大小，这个大小已经通过 *align_object_size* 传递并缩放为字节；对于数组，布局助手是一个负数，包含四个不同的字节，如下所示
+MSB:[tag, hsz, ebt, log2(esz)]:LSB。
+
+对象内存的大小，在解析class文件时就确定了
+```
+jint lh = Klass::instance_layout_helper(info.instance_size, false);
+this_klass->set_layout_helper(lh);
+```
+```
+static jint instance_layout_helper(jint size, bool slow_path_flag) {
+    return (size << LogHeapWordSize)
+      |    (slow_path_flag ? _lh_instance_slow_path_bit : 0);
+  }
+```
+
+---
+
+##### 堆内存分配
+*collectedHeap.inline.hpp*
+``` 
+oop CollectedHeap::obj_allocate(KlassHandle klass, int size, TRAPS) {
+  debug_only(check_for_valid_allocation_state());
+  assert(!Universe::heap()->is_gc_active(), "Allocation during gc not allowed");
+  assert(size >= 0, "int won't convert to size_t");
+  HeapWord* obj = common_mem_allocate_init(klass, size, CHECK_NULL);
+  post_allocation_setup_obj(klass, obj);
+  NOT_PRODUCT(Universe::heap()->check_for_bad_heap_word_value(obj, size));
+  return (oop)obj;
+}
+
+HeapWord* CollectedHeap::common_mem_allocate_init(KlassHandle klass, size_t size, TRAPS) {
+  HeapWord* obj = common_mem_allocate_noinit(klass, size, CHECK_NULL);
+  // 初始化对象
+  init_obj(obj, size);
+  return obj;
+}
+```
+```
+HeapWord* CollectedHeap::common_mem_allocate_noinit(KlassHandle klass, size_t size, TRAPS) {
+
+  // Clear unhandled oops for memory allocation.  Memory allocation might
+  // not take out a lock if from tlab, so clear here.
+  CHECK_UNHANDLED_OOPS_ONLY(THREAD->clear_unhandled_oops();)
+
+  if (HAS_PENDING_EXCEPTION) {
+    NOT_PRODUCT(guarantee(false, "Should not allocate with exception pending"));
+    return NULL;  // caller does a CHECK_0 too
+  }
+
+  HeapWord* result = NULL;
+  // 如果开启了 TLAB ， 则在 TLAB 上分配内存
+  if (UseTLAB) {
+    result = allocate_from_tlab(klass, THREAD, size);
+    if (result != NULL) {
+      assert(!HAS_PENDING_EXCEPTION,
+             "Unexpected exception, will result in uninitialized storage");
+      return result;
+    }
+  }
+  
+  bool gc_overhead_limit_was_exceeded = false;
+  // mem_allocate是一个虚方法，根据使用的垃圾收集器不同，调用对应的分配方法
+  result = Universe::heap()->mem_allocate(size,
+                                          &gc_overhead_limit_was_exceeded);
+  if (result != NULL) {
+    NOT_PRODUCT(Universe::heap()->
+      check_for_non_bad_heap_word_value(result, size));
+    assert(!HAS_PENDING_EXCEPTION,
+           "Unexpected exception, will result in uninitialized storage");
+    // 记录分配的大小
+    THREAD->incr_allocated_bytes(size * HeapWordSize);
+
+    AllocTracer::send_allocation_outside_tlab_event(klass, size * HeapWordSize);
+
+    return result;
+  }
+
+  // 分配失败，可能是超过了gc开销限制，或者内存不足
+  if (!gc_overhead_limit_was_exceeded) {
+    // -XX:+HeapDumpOnOutOfMemoryError and -XX:OnOutOfMemoryError support
+    report_java_out_of_memory("Java heap space");
+
+    if (JvmtiExport::should_post_resource_exhausted()) {
+      JvmtiExport::post_resource_exhausted(
+        JVMTI_RESOURCE_EXHAUSTED_OOM_ERROR | JVMTI_RESOURCE_EXHAUSTED_JAVA_HEAP,
+        "Java heap space");
+    }
+
+    THROW_OOP_0(Universe::out_of_memory_error_java_heap());
+  } else {
+    // -XX:+HeapDumpOnOutOfMemoryError and -XX:OnOutOfMemoryError support
+    report_java_out_of_memory("GC overhead limit exceeded");
+
+    if (JvmtiExport::should_post_resource_exhausted()) {
+      JvmtiExport::post_resource_exhausted(
+        JVMTI_RESOURCE_EXHAUSTED_OOM_ERROR | JVMTI_RESOURCE_EXHAUSTED_JAVA_HEAP,
+        "GC overhead limit exceeded");
+    }
+
+    THROW_OOP_0(Universe::out_of_memory_error_gc_overhead_limit());
+  }
+}
+```
+
+##### 在TLAB分配内存
+```
+HeapWord* CollectedHeap::allocate_from_tlab(KlassHandle klass, Thread* thread, size_t size) {
+  assert(UseTLAB, "should use UseTLAB");
+
+  HeapWord* obj = thread->tlab().allocate(size);
+  if (obj != NULL) {
+    return obj;
+  }
+  // Otherwise...
+  return allocate_from_tlab_slow(klass, thread, size);
+}
+```
+TLAB 分配中，由于是线程私有空间，所以不存在多线程并发分配的问题，不需要加锁，内存分配只是简单的指针碰撞方式,判断剩余空间是否足够，足够的话，简单的重新设置top指针即可。如果不够，会尝试扩展TLAB空间，然后进行分配
+```
+inline HeapWord* ThreadLocalAllocBuffer::allocate(size_t size) {
+  invariants();
+  // 新分配的对象起始地址为TLAB已分配地址的top
+  HeapWord* obj = top();
+  // 空间足够
+  if (pointer_delta(end(), obj) >= size) {
+    // successful thread-local allocation
+#ifdef ASSERT
+    // Skip mangling the space corresponding to the object header to
+    // ensure that the returned space is not considered parsable by
+    // any concurrent GC thread.
+    size_t hdr_size = oopDesc::header_size();
+    Copy::fill_to_words(obj + hdr_size, size - hdr_size, badHeapWordVal);
+#endif // ASSERT
+    // 这个加法是安全的，因为我们知道top至少小于end的大小
+    set_top(obj + size);
+
+    invariants();
+    return obj;
+  }
+  return NULL;
+}
+```
+```
+inline size_t pointer_delta(const void* left,
+                            const void* right,
+                            size_t element_size) {
+  return (((uintptr_t) left) - ((uintptr_t) right)) / element_size;
+}
+```
+
+```
+HeapWord* CollectedHeap::allocate_from_tlab_slow(KlassHandle klass, Thread* thread, size_t size) {
+
+  // 空闲的空间大于 refillWasteLimit指定的大小，记录新的值
+  if (thread->tlab().free() > thread->tlab().refill_waste_limit()) {
+    thread->tlab().record_slow_allocation(size);
+    return NULL;
+  }
+
+  // 丢弃tlab并分配一个新的
+  // 为了最小化碎片，最后一个TLAB可能比其他TLAB更小.
+  size_t new_tlab_size = thread->tlab().compute_size(size);
+
+  thread->tlab().clear_before_allocation();
+
+  if (new_tlab_size == 0) {
+    return NULL;
+  }
+
+  // Allocate a new TLAB...
+  HeapWord* obj = Universe::heap()->allocate_new_tlab(new_tlab_size);
+  if (obj == NULL) {
+    return NULL;
+  }
+
+  AllocTracer::send_allocation_in_new_tlab_event(klass, new_tlab_size * HeapWordSize, size * HeapWordSize);
+
+  if (ZeroTLAB) {
+    // ..and clear it.
+    Copy::zero_to_words(obj, new_tlab_size);
+  } else {
+    // ...and zap just allocated object.
+#ifdef ASSERT
+    // Skip mangling the space corresponding to the object header to
+    // ensure that the returned space is not considered parsable by
+    // any concurrent GC thread.
+    size_t hdr_size = oopDesc::header_size();
+    Copy::fill_to_words(obj + hdr_size, new_tlab_size - hdr_size, badHeapWordVal);
+#endif // ASSERT
+  }
+  thread->tlab().fill(obj, obj + size, new_tlab_size);
+  return obj;
+}
+```
+
+##### 在堆上分配内存
+genCollectedHeap.cpp
+```
+HeapWord* GenCollectedHeap::mem_allocate(size_t size,
+                                         bool* gc_overhead_limit_was_exceeded) {
+  // 分配策略                                         
+  return collector_policy()->mem_allocate_work(size,
+                                               false /* is_tlab */,
+                                               gc_overhead_limit_was_exceeded);
+}
+```
+collectorPolicy.cpp
+
+先无锁的尝试一次快速分配，如果不成功才加锁的方式进行分配；在分配失败时，可能是内存不足，会尝试执行GC回收内存或者扩展堆的方式以获取可用内存；尝试一定次数后，如果还是失败，则说明内存不足了
+```
+HeapWord* GenCollectorPolicy::mem_allocate_work(size_t size,
+                                        bool is_tlab,
+                                        bool* gc_overhead_limit_was_exceeded) {
+  GenCollectedHeap *gch = GenCollectedHeap::heap();
+
+  debug_only(gch->check_for_valid_allocation_state());
+  assert(gch->no_gc_in_progress(), "Allocation during gc not allowed");
+
+  // 只有在gc时间限制被超过时才将其重置为true.
+  *gc_overhead_limit_was_exceeded = false;
+
+  HeapWord* result = NULL;
+
+  // 循环直到分配被满足，或者在GC之后不满足.
+  for (int try_count = 1, gclocker_stalled_count = 0; /* return or throw */; try_count += 1) {
+    HandleMark hm; // discard any handles allocated in each iteration
+
+    // 先无锁的尝试分配一次
+    Generation *gen0 = gch->get_gen(0);
+    assert(gen0->supports_inline_contig_alloc(),
+      "Otherwise, must do alloc within heap lock");
+    if (gen0->should_allocate(size, is_tlab)) {
+      result = gen0->par_allocate(size, is_tlab);
+      if (result != NULL) {
+        assert(gch->is_in_reserved(result), "result not in heap");
+        return result;
+      }
+    }
+    unsigned int gc_count_before;  // 在锁定区域内部读取gc_count
+    {
+      MutexLocker ml(Heap_lock);
+      if (PrintGC && Verbose) {
+        gclog_or_tty->print_cr("TwoGenerationCollectorPolicy::mem_allocate_work:"
+                      " attempting locked slow path allocation");
+      }
+      // 注意，只有大对象才有机会在老年代分配
+      bool first_only = ! should_try_older_generation_allocation(size);
+      // 尝试分配
+      result = gch->attempt_allocation(size, is_tlab, first_only);
+      if (result != NULL) {
+        assert(gch->is_in_reserved(result), "result not in heap");
+        return result;
+      }
+
+      if (GC_locker::is_active_and_needs_gc()) {
+        if (is_tlab) {
+          return NULL;  // Caller will retry allocating individual object
+        }
+        if (!gch->is_maximal_no_gc()) {
+          // 尝试扩展堆以满足请求
+          result = expand_heap_and_allocate(size, is_tlab);
+          // 如果没有空间，结果可能是空的
+          if (result != NULL) {
+            return result;
+          }
+        }
+
+        if (gclocker_stalled_count > GCLockerRetryAllocationCount) {
+          return NULL; // 我们没有做GC，也没有内存 memory
+        }
+
+        // 如果这个线程不在jni临界区中，我们将暂停请求程序，直到临界区清除并允许GC为止。
+        // 当临界段清除时，GC由离开临界段的最后一个线程启动;
+        // 因此，我们从循环的开始重新尝试分配序列，而不是导致更多(现在可能不必要)的GC尝试
+        JavaThread* jthr = JavaThread::current();
+        if (!jthr->in_critical()) {
+          MutexUnlocker mul(Heap_lock);
+          // Wait for JNI critical section to be exited
+          GC_locker::stall_until_clear();
+          gclocker_stalled_count += 1;
+          continue;
+        } else {
+          if (CheckJNICalls) {
+            fatal("Possible deadlock due to allocating while"
+                  " in jni critical section");
+          }
+          return NULL;
+        }
+      }
+
+      // 在持有堆锁时读取gc计数
+      gc_count_before = Universe::heap()->total_collections();
+    }
+
+    VM_GenCollectForAllocation op(size, is_tlab, gc_count_before);
+    VMThread::execute(&op);
+    if (op.prologue_succeeded()) {
+      result = op.result();
+      if (op.gc_locked()) {
+         assert(result == NULL, "must be NULL if gc_locked() is true");
+         continue;  // retry and/or stall as necessary
+      }
+
+      // 分配失败，已完成收集。如果超过了gc时间限制，则返回NULL，这样就会抛出内存不足。
+      // 清除gc_overhead_limit_exceed，使超出的开销不会持久
+
+      const bool limit_exceeded = size_policy()->gc_overhead_limit_exceeded();
+      const bool softrefs_clear = all_soft_refs_clear();
+
+      if (limit_exceeded && softrefs_clear) {
+        *gc_overhead_limit_was_exceeded = true;
+        size_policy()->set_gc_overhead_limit_exceeded(false);
+        if (op.result() != NULL) {
+          CollectedHeap::fill_with_object(op.result(), size);
+        }
+        return NULL;
+      }
+      assert(result == NULL || gch->is_in_reserved(result),
+             "result not in heap");
+      return result;
+    }
+
+    // Give a warning if we seem to be looping forever.
+    if ((QueuedAllocationWarningCount > 0) &&
+        (try_count % QueuedAllocationWarningCount == 0)) {
+          warning("TwoGenerationCollectorPolicy::mem_allocate_work retries %d times \n\t"
+                  " size=%d %s", try_count, size, is_tlab ? "(TLAB)" : "");
+    }
+  }
+}
+```
+##### 无锁快速分配
+
+
+space.cpp 
+由于没有加锁，所以使用CAS的方式去更新堆的top指针
+```
+inline HeapWord* ContiguousSpace::par_allocate_impl(size_t size,
+                                                    HeapWord* const end_value) {
+  do {
+    HeapWord* obj = top();
+    if (pointer_delta(end_value, obj) >= size) {
+      HeapWord* new_top = obj + size;
+      HeapWord* result = (HeapWord*)Atomic::cmpxchg_ptr(new_top, top_addr(), obj);
+      // result can be one of two:
+      //  the old top value: the exchange succeeded
+      //  otherwise: the new value of the top is returned.
+      if (result == obj) {
+        assert(is_aligned(obj) && is_aligned(new_top), "checking alignment");
+        return obj;
+      }
+    } else {
+      return NULL;
+    }
+  } while (true);
+}
+```
+
+##### 加锁分配
+genCollectedHeap.cpp
+```
+HeapWord* GenCollectedHeap::attempt_allocation(size_t size,
+                                               bool is_tlab,
+                                               bool first_only) {
+  HeapWord* res;
+  for (int i = 0; i < _n_gens; i++) {
+    if (_gens[i]->should_allocate(size, is_tlab)) {
+      res = _gens[i]->allocate(size, is_tlab);
+      if (res != NULL) return res;
+      else if (first_only) break;
+    }
+  }
+  // Otherwise...
+  return NULL;
+}
+```
+space.cpp 里的 allocate_impl 只是简单的指针碰撞方式分配
+```
+// 必须加锁
+inline HeapWord* ContiguousSpace::allocate_impl(size_t size,
+                                                HeapWord* const end_value) {
+  // G1垃圾收集，分配内存时，可以多线程串行的分配到不同的区域，不同的GC worker不可以同时访问相同的内存区域
+  assert(Heap_lock->owned_by_self() ||
+         (SafepointSynchronize::is_at_safepoint() &&
+                               (Thread::current()->is_VM_thread() || UseG1GC)),
+         "not locked");
+  HeapWord* obj = top();
+  if (pointer_delta(end_value, obj) >= size) {
+    HeapWord* new_top = obj + size;
+    set_top(new_top);
+    assert(is_aligned(obj) && is_aligned(new_top), "checking alignment");
+    return obj;
+  } else {
+    return NULL;
+  }
+}
+```
+
+##### 对象初始化填充
+对字段进行填零操作，保证Java对象的实例字段在Java代码中可以不用赋处值就可以直接使用
+```
+void CollectedHeap::init_obj(HeapWord* obj, size_t size) {
+  assert(obj != NULL, "cannot initialize NULL object");
+  const size_t hs = oopDesc::header_size();
+  assert(size >= hs, "unexpected object size");
+  ((oop)obj)->set_klass_gap(0);
+  Copy::fill_to_aligned_words(obj + hs, size - hs);
+}
+```
+---
+
+##### 注册finalizer
+如果当前类重写了finalize方法，且非空，需要注册到finalizer队列上
+```
+instanceOop InstanceKlass::register_finalizer(instanceOop i, TRAPS) {
+  if (TraceFinalizerRegistration) {
+    tty->print("Registered ");
+    i->print_value_on(tty);
+    tty->print_cr(" (" INTPTR_FORMAT ") as finalizable", (address)i);
+  }
+  instanceHandle h_i(THREAD, i);
+  // Pass the handle as argument, JavaCalls::call expects oop as jobjects
+  JavaValue result(T_VOID);
+  JavaCallArguments args(h_i);
+  methodHandle mh (THREAD, Universe::finalizer_register_method());
+  JavaCalls::call(&result, mh, &args, CHECK_NULL);
+  return h_i();
+}
+```
+```
+static Method*      finalizer_register_method()     { return _finalizer_register_cache->get_method(); }
+```
+universe.cpp 中 *universe_post_init()* 方法初始化了 *_finalizer_register_cache* ， 而 *universe_post_init()* 方法在JVM启动过程中，会被 *init#init_globals()* => *thread#create_vm()* 调用到
+```c++
+bool universe_post_init() {
+    ...
+    Method* m = InstanceKlass::cast(SystemDictionary::Finalizer_klass())->find_method(
+                                  vmSymbols::register_method_name(),
+                                  vmSymbols::register_method_signature());
+    Universe::_finalizer_register_cache->init(SystemDictionary::Finalizer_klass(), m);
+    ...
+}
+```
+而在 *systemDictionary.cpp* 中定义的 Finalizer_klass 指向 java_lang_ref_Finalizer
+```
+do_klass(Finalizer_klass, java_lang_ref_Finalizer, Pre ) \
+```
+在 vmSymbols.hpp 中定义的 *register_method* 方法
+```
+ template(register_method_name,   "register") \
+```
+所以，最后会调用到 java.lang.ref.Finalizer#register() 方法,把生成的对象封装成Finalizer对象并添加到 Finalizer链表中，对象被GC时，如果是Finalizer对象，会将对象赋值到pending对象。Reference Handler线程会将pending对象push到queue中，Finalizer线程poll到对象，先删除掉Finalizer链表中对应的对象，然后再执行对象的finalize方法；
+```
+final class Finalizer extends FinalReference<Object> {
+    /* Invoked by VM */
+    static void register(Object finalizee) {
+        new Finalizer(finalizee);
+    }
+    
+    private Finalizer(Object finalizee) {
+        super(finalizee, queue);
+        add();
+    }
+    
+    private void add() {
+        synchronized (lock) {
+            if (unfinalized != null) {
+                this.next = unfinalized;
+                unfinalized.prev = this;
+            }
+            unfinalized = this;
+        }
+    }
+}    
+```
+
+---
+
+NOTE：本篇文章分析的情况，基于使用 **指针碰撞** 的方式分配内存（Serial、ParNew收集器），而对于CMS，使用的是 **空闲列表** 的方式进行内存分配。
+
+##### 空闲列表
+compactibleFreeListSpace.cpp
+```
+HeapWord* CompactibleFreeListSpace::allocate(size_t size) {
+  assert_lock_strong(freelistLock());
+  HeapWord* res = NULL;
+  assert(size == adjustObjectSize(size),
+         "use adjustObjectSize() before calling into allocate()");
+  // 是否使用自适应空闲列表
+  if (_adaptive_freelists) {
+    res = allocate_adaptive_freelists(size);
+  } else {  // non-adaptive free lists
+    res = allocate_non_adaptive_freelists(size);
+  }
+
+  if (res != NULL) {
+    // check that res does lie in this space!
+    assert(is_in_reserved(res), "Not in this space!");
+    assert(is_aligned((void*)res), "alignment check");
+
+    FreeChunk* fc = (FreeChunk*)res;
+    fc->markNotFree();
+    assert(!fc->is_free(), "shouldn't be marked free");
+    assert(oop(fc)->klass_or_null() == NULL, "should look uninitialized");
+    // Verify that the block offset table shows this to
+    // be a single block, but not one which is unallocated.
+    _bt.verify_single_block(res, size);
+    _bt.verify_not_unallocated(res, size);
+    // mangle a just allocated object with a distinct pattern.
+    debug_only(fc->mangleAllocated(size));
+  }
+
+  return res;
+}
+```
+```
+HeapWord* CompactibleFreeListSpace::allocate_non_adaptive_freelists(size_t size) {
+  HeapWord* res = NULL;
+  // 尝试对较小的块使用线性分配
+  if (size < _smallLinearAllocBlock._allocation_size_limit) {
+    // if successful, the following also adjusts block offset table
+    res = getChunkFromSmallLinearAllocBlock(size);
+  }
+  // 对于较小的大小，将其分类为索引列表
+  if (res == NULL) {
+    if (size < SmallForDictionary) {
+      res = (HeapWord*) getChunkFromIndexedFreeList(size);
+    } else {
+      // else get it from the big dictionary; if even this doesn't
+      // work we are out of luck.
+      res = (HeapWord*)getChunkFromDictionaryExact(size);
+    }
+  }
+
+  return res;
+}
+```
+---
+
+##### 总结
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在Java中，new关键字代表着生成一个新的对象，在javac进行编译的时候，new关键字被编译为_new指令；JVM在解释执行_new指令时，会确保对应的类已经完成类加载的过程（加载、链接、初始化），然后为其在堆上分配内存，分配的大小，其实在class被加载的时候，就已经知道了；
+
+- 如果开启了TLAB，回先在TLAB上分配，因为是线程私有区域，所以TLAB分配的方式不需要加锁，也不用使用CAS的方式，只是简单的指针碰撞
+- 如果没有开启TLAB或者TLAB分配失败（TLAB上空间不足），将会根据使用的垃圾收集策略选择相应的分配策略进行分配
+- 先进行一次无锁的快速分配，如果分配成功直接返回
+- 无锁分配失败后，开始加锁分配，在一个循环中进行，期间可能触发GC或者堆内存扩展以获取更多内存，如果内存仍然不足，分配失败
