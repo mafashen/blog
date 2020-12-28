@@ -1,0 +1,430 @@
+JVM内部运行的都是C/C++代码，而Java方法是Java语言写的，编译后的Java类是字节码的形式，和JVM内部运行的汇编指令也不一样，那么JVM是怎么调用Java方法呢？
+
+JVM对Java方法的调用基本封装在 *javaCall.cpp* 模块内，其内部提供了对各种类型(静态方法、虚方法、普通方法，构造方法)的Java方法调用方式
+```c++
+class JavaCalls: AllStatic {
+  static void call_helper(JavaValue* result, methodHandle* method, JavaCallArguments* args, TRAPS);
+ public:
+  // Optimized Constuctor call
+  static void call_default_constructor(JavaThread* thread, methodHandle method, Handle receiver, TRAPS);
+
+  // call_special
+  // The receiver must be first oop in argument list
+  static void call_special(JavaValue* result, KlassHandle klass, Symbol* name, Symbol* signature, JavaCallArguments* args, TRAPS);
+  static void call_special(JavaValue* result, Handle receiver, KlassHandle klass, Symbol* name, Symbol* signature, TRAPS); // No args
+  static void call_special(JavaValue* result, Handle receiver, KlassHandle klass, Symbol* name, Symbol* signature, Handle arg1, TRAPS);
+  static void call_special(JavaValue* result, Handle receiver, KlassHandle klass, Symbol* name, Symbol* signature, Handle arg1, Handle arg2, TRAPS);
+
+  // virtual call
+
+  // The receiver must be first oop in argument list
+  static void call_virtual(JavaValue* result, KlassHandle spec_klass, Symbol* name, Symbol* signature, JavaCallArguments* args, TRAPS);
+  static void call_virtual(JavaValue* result, Handle receiver, KlassHandle spec_klass, Symbol* name, Symbol* signature, TRAPS); // No args
+  static void call_virtual(JavaValue* result, Handle receiver, KlassHandle spec_klass, Symbol* name, Symbol* signature, Handle arg1, TRAPS);
+  static void call_virtual(JavaValue* result, Handle receiver, KlassHandle spec_klass, Symbol* name, Symbol* signature, Handle arg1, Handle arg2, TRAPS);
+
+  // Static call
+  static void call_static(JavaValue* result, KlassHandle klass, Symbol* name, Symbol* signature, JavaCallArguments* args, TRAPS);
+  static void call_static(JavaValue* result, KlassHandle klass, Symbol* name, Symbol* signature, TRAPS);
+  static void call_static(JavaValue* result, KlassHandle klass, Symbol* name, Symbol* signature, Handle arg1, TRAPS);
+  static void call_static(JavaValue* result, KlassHandle klass, Symbol* name, Symbol* signature, Handle arg1, Handle arg2, TRAPS);
+
+  // Low-level interface
+  static void call(JavaValue* result, methodHandle method, JavaCallArguments* args, TRAPS);
+};
+```
+
+---
+以调用静态方法为例进行分析
+```
+void JavaCalls::call_static(JavaValue* result, KlassHandle klass, Symbol* name, Symbol* signature, JavaCallArguments* args, TRAPS) {
+  CallInfo callinfo;
+  LinkResolver::resolve_static_call(callinfo, klass, name, signature, KlassHandle(), false, true, CHECK);
+  methodHandle method = callinfo.selected_method();
+  assert(method.not_null(), "should have thrown exception");
+
+  // Invoke the method
+  JavaCalls::call(result, method, args, CHECK);
+}
+```
+```c++
+void JavaCalls::call(JavaValue* result, methodHandle method, JavaCallArguments* args, TRAPS) {
+  // Check if we need to wrap a potential OS exception handler around thread
+  // This is used for e.g. Win32 structured exception handlers
+  assert(THREAD->is_Java_thread(), "only JavaThreads can make JavaCalls");
+  // Need to wrap each and everytime, since there might be native code down the
+  // stack that has installed its own exception handlers
+  // 这里将 call_helper 方法作为 函数指针传递
+  os::os_exception_wrapper(call_helper, result, &method, args, THREAD);
+}
+```
+直接调用传递过来的 call_helper 函数
+```
+void os::os_exception_wrapper(java_call_t f, JavaValue* value, methodHandle* method,
+                         JavaCallArguments* args, Thread* thread) {
+  f(value, method, args, thread);
+}
+```
+```
+void JavaCalls::call_helper(JavaValue* result, methodHandle* m, JavaCallArguments* args, TRAPS) {
+  methodHandle method = *m;
+  JavaThread* thread = (JavaThread*)THREAD;
+  // Java 方法必须是通过 Java类型线程内部调用触发的
+  assert(thread->is_Java_thread(), "must be called by a java thread");
+  assert(method.not_null(), "must have a method to call");
+  assert(!SafepointSynchronize::is_at_safepoint(), "call to Java code during VM operation");
+  assert(!thread->handle_area()->no_handle_mark_active(), "cannot call out to Java here");
+
+
+  CHECK_UNHANDLED_OOPS_ONLY(thread->clear_unhandled_oops();)
+
+  // Verify the arguments
+
+  if (CheckJNICalls)  {
+    args->verify(method, result->get_type(), thread);
+  }
+  else debug_only(args->verify(method, result->get_type(), thread));
+
+  // Ignore call if method is empty
+  if (method->is_empty_method()) {
+    assert(result->get_type() == T_VOID, "an empty method must return a void value");
+    return;
+  }
+
+
+#ifdef ASSERT
+  { InstanceKlass* holder = method->method_holder();
+    // klass可能还没有进行初始化，因为JavaCall可能在执行<clinit>方法执行期间调用
+    // For example, a Thread.start might start executing on an object that is not fully initialized! 
+    assert(holder->is_linked(), "rewritting must have taken place");
+  }
+#endif
+
+
+  assert(!thread->is_Compiler_thread(), "cannot compile from the compiler");
+  if (CompilationPolicy::must_be_compiled(method)) {
+    CompileBroker::compile_method(method, InvocationEntryBci,
+                                  CompilationPolicy::policy()->initial_compile_level(),
+                                  methodHandle(), 0, "must_be_compiled", CHECK);
+  }
+
+  // Since the call stub sets up like the interpreter we call the from_interpreted_entry
+  // so we can go compiled via a i2c. Otherwise initial entry method will always
+  // run interpreted.
+  address entry_point = method->from_interpreted_entry();
+  if (JvmtiExport::can_post_interpreter_events() && thread->is_interp_only_mode()) {
+    entry_point = method->interpreter_entry();
+  }
+
+  // Figure out if the result value is an oop or not (Note: This is a different value
+  // than result_type. result_type will be T_INT of oops. (it is about size)
+  BasicType result_type = runtime_type_from(result);
+  bool oop_result_flag = (result->get_type() == T_OBJECT || result->get_type() == T_ARRAY);
+
+  // NOTE: if we move the computation of the result_val_address inside
+  // the call to call_stub, the optimizer produces wrong code.
+  intptr_t* result_val_address = (intptr_t*)(result->get_value_addr());
+
+  // Find receiver
+  Handle receiver = (!method->is_static()) ? args->receiver() : Handle();
+
+  // When we reenter Java, we need to reenable the yellow zone which
+  // might already be disabled when we are in VM.
+  if (thread->stack_yellow_zone_disabled()) {
+    thread->reguard_stack();
+  }
+
+  // Check that there are shadow pages available before changing thread state
+  // to Java
+  if (!os::stack_shadow_pages_available(THREAD, method)) {
+    // Throw stack overflow exception with preinitialized exception.
+    Exceptions::throw_stack_overflow_exception(THREAD, __FILE__, __LINE__, method);
+    return;
+  } else {
+    // Touch pages checked if the OS needs them to be touched to be mapped.
+    os::bang_stack_shadow_pages();
+  }
+
+  // do call
+  { JavaCallWrapper link(method, receiver, result, CHECK);
+    { HandleMark hm(thread);  // HandleMark used by HandleMarkCleaner
+      // call_stub 返回一个函数指针， 这里直接进行函数调用
+      StubRoutines::call_stub()(
+        (address)&link,
+        // (intptr_t*)&(result->_value), // see NOTE above (compiler problem)
+        result_val_address,          // see NOTE above (compiler problem)
+        result_type,
+        method(), // 通过 Method 可以获取到Java方法编译后的字节码信息进行调用
+        entry_point,
+        args->parameters(),
+        args->size_of_parameters(),
+        CHECK
+      );
+
+      result = link.result();  // circumvent MS C++ 5.0 compiler bug (result is clobbered across call)
+      // Preserve oop return value across possible gc points
+      if (oop_result_flag) {
+        thread->set_vm_result((oop) result->get_jobject());
+      }
+    }
+  } // Exit JavaCallWrapper (can block - potential return oop must be preserved)
+
+  // Check if a thread stop or suspend should be executed
+  // The following assert was not realistic.  Thread.stop can set that bit at any moment.
+  //assert(!thread->has_special_runtime_exit_condition(), "no async. exceptions should be installed");
+
+  // Restore possible oop return
+  if (oop_result_flag) {
+    result->set_jobject((jobject)thread->vm_result());
+    thread->set_vm_result(NULL);
+  }
+}
+```
+
+---
+
+#### Call_Stub 分析
+call_stub函数定义如下，
+```
+static CallStub call_stub()                              { return CAST_TO_FN_PTR(CallStub, _call_stub_entry); }
+```
+其中 *CAST_TO_FN_PTR* 是一个宏定义
+```
+#define CAST_TO_FN_PTR(func_type, value) ((func_type)(castable_address(value)))
+```
+进行宏替换转换后，得到
+```
+return (CallStub)(castable_address(_call_stub_entry))
+```
+CallStub是一个函数指针
+```
+typedef void (*CallStub)(
+    address   link,
+    intptr_t* result,
+    BasicType result_type,
+    Method* method,
+    address   entry_point,
+    intptr_t* parameters,
+    int       size_of_parameters,
+    TRAPS
+  );
+```
+call_helper中进行了隐式地调用了函数指针，那么 *_call_stub_entry* 又是什么？
+*_call_stub_entry* 定义在 *stubRoutines.cpp* 中，是一个地址类型变量，在虚拟机启动过程中，会进行下面链路的调用路径,
+```
+thread::create_vm() => init::init_globals() => stubRoutines::stubRoutines_init1() => StubRoutines::initialize1() => StubGenerator_x86_32::generate_initial() => generate_call_stub()
+```
+最终设置了 *_call_stub_entry* ，使其指向一个例程。
+```
+address StubRoutines::_call_stub_entry                          = NULL;
+```
+```
+// stubGenerator_x86_32.cpp 生成函数调用例程，返回生成的机器指令的首地址（函数入口）
+  address generate_call_stub(address& return_address) {
+    StubCodeMark mark(this, "StubRoutines", "call_stub");
+    address start = __ pc();    // _code_pos
+
+    // stub code parameters / addresses
+    assert(frame::entry_frame_call_wrapper_offset == 2, "adjust this code");
+    bool  sse_save = false;
+    const Address rsp_after_call(rbp, -4 * wordSize); // same as in generate_catch_exception()!         == mxcsr_save   call entry_point 返回时rsp, 上一栈桢基址
+    const int     locals_count_in_bytes  (4*wordSize);
+    const Address mxcsr_save    (rbp, -4 * wordSize);
+    const Address saved_rbx     (rbp, -3 * wordSize);
+    const Address saved_rsi     (rbp, -2 * wordSize);
+    const Address saved_rdi     (rbp, -1 * wordSize); // 位于 call_stub 函数堆栈内
+    const Address result        (rbp,  3 * wordSize); // 位于 call_helper 函数堆栈内
+    const Address result_type   (rbp,  4 * wordSize);
+    const Address method        (rbp,  5 * wordSize);
+    const Address entry_point   (rbp,  6 * wordSize);
+    const Address parameters    (rbp,  7 * wordSize);
+    const Address parameter_size(rbp,  8 * wordSize);
+    const Address thread        (rbp,  9 * wordSize); // same as in generate_catch_exception()!
+    sse_save =  UseSSE > 0;
+
+    // JVM需要在运行时知道一个Java函数的入参大小，然后动态计算出所需要的堆栈空间
+            // JVM将Java函数堆栈空间"寄生"在 CallStub() 函数堆栈中，能够将Java程序被调用的函数的入参分配到其堆栈中，这样在Java函数中才能对Java类型的入参进行寻址
+    // stub code
+    __ enter();     //macroAssembler_x86.cpp => push(rbp); mov(rbp, rsp); 模拟物理机调用 call 指令效果 ， 保存调用者 栈基地址，重新指定栈基地址
+      // JVM在内存上建立了一套Java面向对象的标准模型（oop-klass），在JVM内部，一切对Java对象实例及其成员变量和成员方法的访问，最终皆通过指针得以寻址.
+      // JVM在传递Java函数参数时，所传递的只是Java入参对象实例的指针，而在物理机层面，指针宽度都是相同的，所以通过入参数量就可以计算出入参所需要的堆栈空间
+    __ movptr(rcx, parameter_size);              // parameter counter   Java函数的入参大小由Java编译器在编译期间计算出来
+    __ shlptr(rcx, Interpreter::logStackElementSize); // convert parameter count to bytes shl $0x2, %ecx 作用 paramSize*4（32位）入参数量转换为字节数
+      // 一条 JVM 字节码指令转换为若干条机器指令，物理机无法对JVM字节码进行自动取值，因此对JVM字节码的取值机制需要由JVM自己去实现
+    __ addptr(rcx, locals_count_in_bytes);       // reserve space for register saves 额外的大小（16）    保存调用者 基址 和 变址 rdi rsi rbx mxcsr 寄存器
+    __ subptr(rsp, rcx);                         // 动态堆栈分配
+    __ andptr(rsp, -(StackAlignmentInBytes));    // Align stack 内存对齐(按16位对齐)   and $0xfffffff0, %esp
+
+    // save rdi, rsi, & rbx, according to C calling conventions     调用者保存自己的寄存器数据（私有数据），保存到被调用者函数的堆栈中   CS:IP
+    __ movptr(saved_rdi, rdi);      // edi 保存目的偏移地址
+    __ movptr(saved_rsi, rsi);      // esi 用于Java字节码寻址
+    __ movptr(saved_rbx, rbx);      // ebx 存放Java函数即将被执行的字节码指令的基地址
+    // save and initialize %mxcsr
+    if (sse_save) {
+      Label skip_ldmx;
+      __ stmxcsr(mxcsr_save);
+      __ movl(rax, mxcsr_save);
+      __ andl(rax, MXCSR_MASK);    // Only check control and mask bits
+      ExternalAddress mxcsr_std(StubRoutines::addr_mxcsr_std());
+      __ cmp32(rax, mxcsr_std);
+      __ jcc(Assembler::equal, skip_ldmx);
+      __ ldmxcsr(mxcsr_std);
+      __ bind(skip_ldmx);
+    }
+
+    // make sure the control word is correct.
+    __ fldcw(ExternalAddress(StubRoutines::addr_fpu_cntrl_wrd_std()));
+
+#ifdef ASSERT
+    // make sure we have no pending exceptions
+    { Label L;
+      __ movptr(rcx, thread);
+      __ cmpptr(Address(rcx, Thread::pending_exception_offset()), (int32_t)NULL_WORD);
+      __ jcc(Assembler::equal, L);
+      __ stop("StubRoutines::call_stub: entered with pending exception");
+      __ bind(L);
+    }
+#endif
+
+    // pass parameters if any   参数压栈
+    BLOCK_COMMENT("pass parameters if any");
+    Label parameters_done;
+    __ movl(rcx, parameter_size);  // parameter counter
+    __ testl(rcx, rcx);
+    __ jcc(Assembler::zero, parameters_done);
+
+    // parameter passing loop
+
+    Label loop;
+    // Copy Java parameters in reverse order (receiver last)
+    // Note that the argument order is inverted in the process
+    // source is rdx[rcx: N-1..0]
+    // dest   is rsp[rbx: 0..N-1]
+
+    __ movptr(rdx, parameters);          // parameter pointer %edx parameter首地址
+    __ xorptr(rbx, rbx);                // %ebx = 0 下标（call_stub栈内位置）  %rcx parameterSize
+
+    __ BIND(loop);
+
+    // get parameter
+    __ movptr(rax, Address(rdx, rcx, Interpreter::stackElementScale(), -worgidSize));   // mov -0x4(%edx,%ecx,4), %eax  arg[n] address
+    __ movptr(Address(rsp, rbx, Interpreter::stackElementScale(),
+                    Interpreter::expr_offset_in_bytes(0)), rax);          // store parameter    mov %eax, (%esp,%ebx,4) 压栈
+    __ increment(rbx);  // 下标+1
+    __ decrement(rcx);  // 待处理总数-1  逆向遍历
+    __ jcc(Assembler::notZero, loop);
+
+    // call Java function
+    __ BIND(parameters_done);
+    __ movptr(rbx, method);           // get Method*    通过method寻址到Java函数所对应的第一个字节码指令
+    __ movptr(rax, entry_point);      // get entry_point
+    __ mov(rsi, rsp);                 // set sender sp      mov %esp, %rsi 保存当前栈顶
+    BLOCK_COMMENT("call Java function");
+    __ call(rax);                     // push %ebp; move %esp, %ebp; call entry_point
+
+    BLOCK_COMMENT("call_stub_return_address:");
+    return_address = __ pc();         // entry_point 执行完的返回地址（下一条执行指令地址） call 指令返回时自动 pop 取出 ip值
+
+#ifdef COMPILER2
+    {
+      Label L_skip;
+      if (UseSSE >= 2) {
+        __ verify_FPU(0, "call_stub_return");
+      } else {
+        for (int i = 1; i < 8; i++) {
+          __ ffree(i);
+        }
+
+        // UseSSE <= 1 so double result should be left on TOS
+        __ movl(rsi, result_type);
+        __ cmpl(rsi, T_DOUBLE);
+        __ jcc(Assembler::equal, L_skip);
+        if (UseSSE == 0) {
+          // UseSSE == 0 so float result should be left on TOS
+          __ cmpl(rsi, T_FLOAT);
+          __ jcc(Assembler::equal, L_skip);
+        }
+        __ ffree(0);
+      }
+      __ BIND(L_skip);
+    }
+#endif // COMPILER2
+
+    // store result depending on type
+    // (everything that is not T_LONG, T_FLOAT or T_DOUBLE is treated as T_INT)
+    __ movptr(rdi, result); // mov 0xc(%rbp) %rdi
+    Label is_long, is_float, is_double, exit;
+    __ movl(rsi, result_type); // mov 0x10(%rbp) %rsi
+    __ cmpl(rsi, T_LONG);       // if result_type is long
+    __ jcc(Assembler::equal, is_long);
+    __ cmpl(rsi, T_FLOAT);
+    __ jcc(Assembler::equal, is_float);
+    __ cmpl(rsi, T_DOUBLE);
+    __ jcc(Assembler::equal, is_double);
+
+    // handle T_INT case
+    __ movl(Address(rdi, 0), rax);  // %rax中保存了调用entry_point时返回的值，放入resultAddress中
+    __ BIND(exit);
+
+    // check that FPU stack is empty
+    __ verify_FPU(0, "generate_call_stub");
+
+    // pop parameters
+    __ lea(rsp, rsp_after_call);
+
+    // restore %mxcsr
+    if (sse_save) {
+      __ ldmxcsr(mxcsr_save);
+    }
+
+    // restore rdi, rsi and rbx,        恢复保存的 rdi rsi rbx 寄存器值
+    __ movptr(rbx, saved_rbx);
+    __ movptr(rsi, saved_rsi);
+    __ movptr(rdi, saved_rdi);
+    __ addptr(rsp, 4*wordSize);
+
+    // return
+    __ pop(rbp);    // pop %rbp
+    __ ret(0);      // pop %eip     add %esp
+
+    // handle return types different from T_INT     返回的类型不是 int ， long需要返回两个字节的内容
+    __ BIND(is_long);
+    __ movl(Address(rdi, 0 * wordSize), rax);
+    __ movl(Address(rdi, 1 * wordSize), rdx);
+    __ jmp(exit);
+
+    __ BIND(is_float);
+    // interpreter uses xmm0 for return values
+    if (UseSSE >= 1) {
+      __ movflt(Address(rdi, 0), xmm0);
+    } else {
+      __ fstp_s(Address(rdi, 0));
+    }
+    __ jmp(exit);
+
+    __ BIND(is_double);
+    // interpreter uses xmm0 for return values
+    if (UseSSE >= 2) {
+      __ movdbl(Address(rdi, 0), xmm0);
+    } else {
+      __ fstp_d(Address(rdi, 0));
+    }
+    __ jmp(exit);
+
+    return start;
+  }
+```
+
+JVM 调用 Java 方法的时候，都会经过 Call_Stub ，在进入真正的字节码执行（通过传入的method句柄获取）之前，JVM会模拟物理机方法调用，为Java方法分配栈空间，执行方法调用后，处理返回值等。
+
+```
+graph TD
+A[callStub]-->B[保存PC]
+B-->C[创建局部变量]
+C-->D[移动栈指针rsp划分空间]
+D-->E[寄存器数据保存]
+E-->F[参数复制]
+F-->G[call rax]
+G-->H[恢复寄存器]
+H-->I[return]
+```
