@@ -1,5 +1,5 @@
 在进行MinorGC的时候，新生代一般使用的复制算法，在标记完存活对象后，需要将仍然存活的对象复制到survivor区，下面是hotspot中将对象复制到survivor区的实现代码
-```
+```c
 oop DefNewGeneration::copy_to_survivor_space(oop old) {
   assert(is_in_reserved(old) && !old->is_forwarded(),
          "shouldn't be scavenging this oop");
